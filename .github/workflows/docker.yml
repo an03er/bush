@@ -45,6 +45,7 @@ jobs:
         run: |
           cd docker
           docker build -t myapp-test .
+          docker push "myapp-test:${{ github.sha }}"
 
   deploy:
     needs: build
@@ -55,8 +56,11 @@ jobs:
 
       - name: Deploy to Server
         run: |
-          cd docker
-          podman stop --all
-          podman rm --all -f
-          podman-compose down
-          podman-compose -p docker up -d --build
+          podman pull "$myapp-test:${{ github.sha }}"
+          podman rm myapp-container || true
+          podman run -d --name usersapp --network host \
+            -e DATABASE_URL="postgresql+psycopg://kubsu:kubsu@127.0.0.1:5432/kubsu" \
+            -e ROOT_PATH="/${{ secrets.USERNAME }}" \
+            "$myapp-test:${{ github.sha }}"
+
+          podman ps
