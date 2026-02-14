@@ -1,16 +1,44 @@
-name: CI/CD Pipeline
+name: CI/CD
 
 on:
   push:
-    branches:
-      - main
+    branches: [ master ]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/docker_linux
 
 jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build & push PROD image
+        run: |
+          set -e
+          docker build --target prod -t "${IMAGE}:${{ github.sha }}" .
+          docker push "${IMAGE}:${{ github.sha }}"
+
+      - name: Build & push TEST image
+        run: |
+          set -e
+          docker build --target test -t "${IMAGE}:test-${{ github.sha }}" .
+          docker push "${IMAGE}:test-${{ github.sha }}"
+
   test:
     runs-on: ubuntu-latest
+    needs: build
+
     services:
       db:
-        image: postgres:15-alpine
+        image: postgres:16-alpine
         env:
           POSTGRES_USER: kubsu
           POSTGRES_PASSWORD: kubsu
@@ -18,63 +46,44 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          --health-cmd "pg_isready -U kubsu -d kubsu"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+      - name: Pull TEST image
+        run: docker pull "${IMAGE}:test-${{ github.sha }}"
 
-      - name: Install dependencies and run tests
+      - name: Run tests inside built image
         run: |
-          cd docker
-          pip install ".[test]"
-          export DATABASE_URL=postgresql+psycopg://kubsu:kubsu@localhost:5432/kubsu
-          export PYTHONPATH=$PYTHONPATH:$(pwd)
-          pytest tests
-        env:
-          DATABASE_URL: postgresql+psycopg://kubsu:kubsu@localhost:5432/kubsu
-
-  build:
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Build and Push Docker Image
-        run: |
-          cd docker
-          docker build -t myapp-test:${{ github.sha }} .
-          docker push myapp-test:${{ github.sha }}
+          set -e
+          docker run --rm --network host \
+            -e DATABASE_URL="postgresql+psycopg://kubsu:kubsu@127.0.0.1:5432/kubsu" \
+            -e ROOT_PATH="" \
+            "${IMAGE}:test-${{ github.sha }}"
 
   deploy:
-    needs: build
     runs-on: self-hosted
+    needs: test
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Login to GHCR (podman)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Deploy to Server
+      - name: Pull & run app (uses server Postgres)
         run: |
-          podman pull myapp-test:${{ github.sha }}
-          podman stop usersapp || true
-          podman rm usersapp || true
+          set -e
+          podman pull "${IMAGE}:${{ github.sha }}"
+
+          podman rm -f usersapp 2>/dev/null || true
+
+          # контейнер слушает 8008, на хосте открываем порт из секрета
           podman run -d --name usersapp --network host \
-            -e DATABASE_URL="postgresql+psycopg://kubsu:kubsu@localhost:5432/kubsu" \
+            -e DATABASE_URL="postgresql+psycopg://kubsu:kubsu@127.0.0.1:5432/kubsu" \
             -e ROOT_PATH="/${{ secrets.USERNAME }}" \
-            myapp-test:${{ github.sha }}
+            "${IMAGE}:${{ github.sha }}"
 
           podman ps
