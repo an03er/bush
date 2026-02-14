@@ -1,44 +1,21 @@
-name: CI/CD
+name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ master ]
-
-permissions:
-  contents: read
-  packages: write
+    branches:
+      - main
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/docker_linux
+  REGISTRY: ghcr.io
+  # Важно: имя должно быть в нижнем регистре!
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Build & push PROD image
-        run: |
-          set -e
-          docker build --target prod -t "${IMAGE}:${{ github.sha }}" .
-          docker push "${IMAGE}:${{ github.sha }}"
-
-      - name: Build & push TEST image
-        run: |
-          set -e
-          docker build --target test -t "${IMAGE}:test-${{ github.sha }}" .
-          docker push "${IMAGE}:test-${{ github.sha }}"
-
   test:
     runs-on: ubuntu-latest
-    needs: build
-
     services:
       db:
-        image: postgres:16-alpine
+        image: postgres:15-alpine
         env:
           POSTGRES_USER: kubsu
           POSTGRES_PASSWORD: kubsu
@@ -46,44 +23,95 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U kubsu -d kubsu"
-          --health-interval 2s
-          --health-timeout 2s
-          --health-retries 30
-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
-      - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Pull TEST image
-        run: docker pull "${IMAGE}:test-${{ github.sha }}"
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
 
-      - name: Run tests inside built image
+      - name: Install dependencies and run tests
         run: |
-          set -e
-          docker run --rm --network host \
-            -e DATABASE_URL="postgresql+psycopg://kubsu:kubsu@127.0.0.1:5432/kubsu" \
-            -e ROOT_PATH="" \
-            "${IMAGE}:test-${{ github.sha }}"
+          cd docker
+          pip install ".[test]"
+          export DATABASE_URL=postgresql+psycopg://kubsu:kubsu@localhost:5432/kubsu
+          export PYTHONPATH=$PYTHONPATH:$(pwd)
+          pytest tests
+        env:
+          DATABASE_URL: postgresql+psycopg://kubsu:kubsu@localhost:5432/kubsu
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    # Важно! Даем права на запись в пакеты
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Аутентификация в GHCR с использованием GITHUB_TOKEN
+      - name: Log in to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build Docker image
+        run: |
+          cd docker
+          # Собираем с правильным тегом для GHCR
+          docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+
+      - name: Push image to GHCR
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      # Также помечаем как latest (опционально)
+      - name: Tag and push as latest
+        run: |
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
   deploy:
+    needs: build-and-push
     runs-on: self-hosted
-    needs: test
+    permissions:
+      contents: read
+      packages: read  # Для self-hosted runner тоже нужны права на чтение
+    
     steps:
-      - name: Login to GHCR (podman)
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Pull & run app (uses server Postgres)
+      # Аутентификация на self-hosted runner
+      - name: Log in to GitHub Container Registry
         run: |
-          set -e
-          podman pull "${IMAGE}:${{ github.sha }}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+        # Если на сервере используется podman вместо docker, замените на:
+        # echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
 
-          podman rm -f usersapp 2>/dev/null || true
-
-          # контейнер слушает 8008, на хосте открываем порт из секрета
+      - name: Deploy to Server
+        run: |
+          # Используем правильный полный тег образа из GHCR
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          
+          echo "Pulling image: $IMAGE"
+          # Замените docker на podman если нужно
+          podman pull $IMAGE
+          
+          podman stop usersapp || true
+          podman rm usersapp || true
+          
           podman run -d --name usersapp --network host \
-            -e DATABASE_URL="postgresql+psycopg://kubsu:kubsu@127.0.0.1:5432/kubsu" \
+            -e DATABASE_URL="postgresql+psycopg://kubsu:kubsu@localhost:5432/kubsu" \
             -e ROOT_PATH="/${{ secrets.USERNAME }}" \
-            "${IMAGE}:${{ github.sha }}"
+            $IMAGE
 
           podman ps
